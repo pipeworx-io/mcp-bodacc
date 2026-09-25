@@ -452,7 +452,42 @@ async function fetchWithTimeout(
         ),
       );
     }
-    throw err;
+    // Fleet #2382. Everything that isn't a timeout/abort here is a genuine
+    // NETWORK-LEVEL failure — DNS resolution, connection refused, TLS handshake,
+    // Cloudflare's own "Network connection lost." — meaning `fetch()` itself
+    // threw and no HTTP response of any kind was ever received. Until this fix
+    // that raw exception was rethrown VERBATIM: a bare `TypeError: fetch failed`
+    // (or the Workers-runtime equivalent) names no upstream, carries no class
+    // token, and reads exactly like a defect in OUR code — because it says
+    // nothing about the call at all. It landed in `error`, the tier that means
+    // "Pipeworx has a defect", for every one of the (at the time of writing)
+    // ~470 packs that call this helper directly with no wrapper of their own.
+    //
+    // `dexscreener` hit this independently (fleet #1579) and fixed it with a
+    // bespoke per-pack try/catch around `fetchWithTimeout`. That fix is correct
+    // but only covers one pack; every other caller of this shared helper still
+    // leaked the raw exception. Moving the same fix HERE — the one place that
+    // already carries the timeout case — covers every pack that uses
+    // `fetchWithTimeout` without a wrapper, for free, and without widening
+    // `classifyToolError`'s regex list: the fix is giving the message a proper
+    // `upstream_down:` token at the point the two facts (no response was ever
+    // received, and which host we were trying to reach) are actually in hand,
+    // not teaching the classifier to guess from prose after the fact.
+    //
+    // Safe on the same grounds as the timeout branch above: no argument a
+    // caller passes can make `fetch()` itself throw a connection-level error,
+    // so this is always an availability failure, never a caller mistake. Same
+    // `markInternalOrigin` treatment — an origin we run that never answered is
+    // still ours, not a third party's outage.
+    const raw = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      markInternalOrigin(
+        `upstream_down: could not reach ${name} at all (${raw.slice(0, 160)}). ` +
+          `No request reached ${name}, so this says NOTHING about whether the arguments you passed ` +
+          'are valid — do not re-check them on the strength of this error. Retry shortly.',
+        url,
+      ),
+    );
   }
 }
 
@@ -692,6 +727,43 @@ const EVENT_TYPES = [
   'divers', // Annonces diverses
 ] as const;
 
+// English aliases a caller is likely to reach for instead of the French
+// familleavis code. Mapped, not merely documented, so a natural-language
+// guess still works rather than silently matching zero rows.
+const EVENT_TYPE_ALIASES: Record<string, string> = {
+  sale: 'vente',
+  sales: 'vente',
+  transfer: 'vente',
+  transfers: 'vente',
+  insolvency: 'collective',
+  bankruptcy: 'collective',
+  deregistration: 'radiation',
+  deletion: 'radiation',
+  accounts: 'dpc',
+  account_filing: 'dpc',
+  accounts_filing: 'dpc',
+  registration: 'immatriculation',
+};
+
+// Validates + normalizes an event_type argument, accepting either a real
+// familleavis code or one of the English aliases above (case-insensitive).
+// Returns an explicit error (never a silent pass-through) on anything else,
+// because an unrecognized code sent straight to the upstream `where=` clause
+// used to match zero rows with no indication the filter itself was wrong.
+function normalizeEventType(v: unknown): { code?: string; error?: string } {
+  const s = strArg(v);
+  if (!s) return {};
+  const lower = s.toLowerCase();
+  if ((EVENT_TYPES as readonly string[]).includes(lower)) return { code: lower };
+  if (EVENT_TYPE_ALIASES[lower]) return { code: EVENT_TYPE_ALIASES[lower] };
+  return {
+    error:
+      `Unknown event_type "${s}". Valid values: ${EVENT_TYPES.join(', ')}. ` +
+      `English aliases also accepted: sale/transfer→vente, insolvency/bankruptcy→collective, ` +
+      `deregistration/deletion→radiation, accounts→dpc, registration→immatriculation.`,
+  };
+}
+
 const tools: McpToolExport['tools'] = [
   {
     name: 'bodacc_company_events',
@@ -702,7 +774,7 @@ const tools: McpToolExport['tools'] = [
       properties: {
         siren: { type: 'string', description: '9-digit French SIREN identifier, e.g. "805243102" (spaces ignored). Preferred over name — exact match.' },
         name: { type: 'string', description: 'Company name (commerçant/dénomination) to search when SIREN is unknown, e.g. "Marine Services Maintenance". Free-text, matches any word.' },
-        event_type: { type: 'string', enum: [...EVENT_TYPES], description: 'Restrict to one event family. Omit for the full history.' },
+        event_type: { type: 'string', description: `Restrict to one event family — one of: ${EVENT_TYPES.join(', ')}. English aliases also accepted: sale/transfer→vente, insolvency/bankruptcy→collective, deregistration/deletion→radiation, accounts→dpc, registration→immatriculation. Omit for the full history.` },
         limit: { type: ['number', 'string'], description: 'Number of notices to return (1-100). Default 20.' },
         offset: { type: ['number', 'string'], description: 'Result offset for pagination. Default 0.' },
       },
@@ -711,12 +783,13 @@ const tools: McpToolExport['tools'] = [
   {
     name: 'bodacc_search',
     description:
-      'Search all BODACC notices across every French company by free text, event family, département, and/or publication date range. Returns the most recently published notices first, each shaped with SIREN, company name, event family, court (greffe), location, and notice detail. Use for open-ended discovery (e.g. "insolvency notices in Lyon since August" or "business sales in Paris this month") — use bodacc_company_events instead when you already have a SIREN or exact name.',
+      'Search all BODACC notices across every French company by free text (searched across the whole notice — company name, activity, judgment/act text, addresses — not just the name), event family, département, and/or publication date range. Returns the most recently published notices first, each shaped with SIREN, company name, event family, court (greffe), location, and notice detail. Use for open-ended discovery (e.g. "insolvency notices in Lyon since August" or "business sales in Paris this month") — use bodacc_company_events instead when you already have a SIREN or exact name. Use `name` instead of `q` when you specifically want to match the company name/denomination only.',
     inputSchema: {
       type: 'object',
       properties: {
-        q: { type: 'string', description: 'Free-text search over the company name (commerçant/dénomination). Omit to list by filters/date alone.' },
-        event_type: { type: 'string', enum: [...EVENT_TYPES], description: 'Event family: collective=insolvency, vente=sale/transfer of business, radiation=deregistration, creation=new registration, modification, dpc=account filing, conciliation, retablissement_professionnel, immatriculation, divers.' },
+        q: { type: 'string', description: 'Free-text search across the whole notice (company name, activity description, judgment/act text, address, etc). Omit to list by filters/date alone.' },
+        name: { type: 'string', description: 'Search the company name (commerçant/dénomination) field only, instead of the whole-notice free text of `q`.' },
+        event_type: { type: 'string', description: `Event family — one of: ${EVENT_TYPES.join(', ')} (collective=insolvency, vente=sale/transfer of business, radiation=deregistration, creation=new registration, modification, dpc=account filing, conciliation, retablissement_professionnel, immatriculation, divers). English aliases also accepted: sale/transfer→vente, insolvency/bankruptcy→collective, deregistration/deletion→radiation, accounts→dpc, registration→immatriculation.` },
         departement: { type: 'string', description: 'French département code to filter on, e.g. "75" (Paris), "13" (Bouches-du-Rhône), "2A"/"2B" (Corsica).' },
         since: { type: 'string', description: 'Only notices published on/after this date, YYYY-MM-DD.' },
         until: { type: 'string', description: 'Only notices published on/before this date, YYYY-MM-DD.' },
@@ -901,7 +974,8 @@ async function companyEvents(args: Record<string, unknown>): Promise<unknown> {
   if (!siren && !name) {
     throw new Error('bodacc_company_events requires either "siren" (9-digit SIREN) or "name" (company name).');
   }
-  const eventType = strArg(args.event_type);
+  const { code: eventType, error: eventTypeError } = normalizeEventType(args.event_type);
+  if (eventTypeError) throw new Error(eventTypeError);
   const limit = clampInt(args.limit, 20, 1, 100);
   const offset = clampInt(args.offset, 0, 0, MAX_WINDOW);
 
@@ -926,7 +1000,9 @@ async function companyEvents(args: Record<string, unknown>): Promise<unknown> {
 
 async function search(args: Record<string, unknown>): Promise<unknown> {
   const q = strArg(args.q);
-  const eventType = strArg(args.event_type);
+  const name = strArg(args.name);
+  const { code: eventType, error: eventTypeError } = normalizeEventType(args.event_type);
+  if (eventTypeError) throw new Error(eventTypeError);
   const departement = strArg(args.departement);
   const since = normalizeDate(args.since);
   const until = normalizeDate(args.until);
@@ -935,7 +1011,15 @@ async function search(args: Record<string, unknown>): Promise<unknown> {
   const offset = clampInt(args.offset, 0, 0, MAX_WINDOW);
 
   const clauses: string[] = [];
-  if (q) clauses.push(`search(commercant, ${odsqlStr(q)})`);
+  // `q` is whole-notice full text: search(<term>) with NO field name searches
+  // every indexed field (name, activity, judgment/act text, address, ...).
+  // search(commercant, <term>) — the field-scoped form — only ever matches
+  // the company name, which silently zeroed out any query about the notice
+  // CONTENT (e.g. "fonds de commerce"): 0 rows via the field-scoped form vs
+  // 3188 via the unscoped form, confirmed live 2026-09-23. `name` is the
+  // separate, deliberately field-scoped arg for name-only matching.
+  if (q) clauses.push(`search(${odsqlStr(q)})`);
+  if (name) clauses.push(`search(commercant, ${odsqlStr(name)})`);
   if (eventType) clauses.push(`familleavis=${odsqlStr(eventType)}`);
   if (departement) clauses.push(`numerodepartement=${odsqlStr(departement)}`);
   if (siren) clauses.push(`registre=${odsqlStr(siren)}`);
@@ -952,6 +1036,7 @@ async function search(args: Record<string, unknown>): Promise<unknown> {
   const data = await bodaccGet(params);
   return buildResult(data, limit, offset, {
     ...(q ? { q } : {}),
+    ...(name ? { name } : {}),
     ...(eventType ? { event_type: eventType } : {}),
     ...(departement ? { departement } : {}),
     ...(siren ? { siren } : {}),
