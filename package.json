@@ -1,6 +1,6 @@
 {
   "name": "@pipeworx/mcp-bodacc",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "BODACC MCP — French official business-events bulletin (keyless).",
   "type": "module",
   "main": "src/index.ts",
@@ -26,7 +26,7 @@
     "@cloudflare/workers-types": "^4.20260405.1"
   },
   "pipeworx": {
-    "sourceHash": "v1-08d0bc6b76d729f6064871aa369c0f20a02b1f38fd5c0d221d1502be7ec56ebd",
-    "sourceCommit": "babdd280d475dceddecc9ebf8f2a661712781a81"
+    "sourceHash": "v1-58c56ab5c7880298722a086459b212db96b7d7ce37f5a15204e9f7dc071a7eac",
+    "sourceCommit": "5d8d3a58a457b8464c117515d81b8b6ecb53fdfb"
   }
 }
